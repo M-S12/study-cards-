@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Study Cards</title>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #1f3b32; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- Babel (in-browser JSX transpiler, no build step needed). React itself is loaded
+     as an ES module below via the import map, so it's not duplicated here. -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<div id="fallback-error" style="display:none; color:#fbf8f1; font-family: monospace; padding: 24px; white-space: pre-wrap;"></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var box = document.getElementById("fallback-error");
+    box.style.display = "block";
+    box.textContent = "Something failed to load:\n" + (e.message || e.error || e);
+  });
+</script>
+
+<script>
+  // ---- localStorage-backed shim for the window.storage API used by the app ----
+  // Swap this out for a real backend (e.g. your own API + database) if you
+  // want data to sync across devices instead of staying in this browser.
+  (function () {
+    const ns = (key, shared) => `studycards:${shared ? "shared" : "user"}:${key}`;
+    window.storage = {
+      async get(key, shared = false) {
+        const raw = localStorage.getItem(ns(key, shared));
+        if (raw === null) throw new Error("Key not found: " + key);
+        return { key, value: raw, shared: !!shared };
+      },
+      async set(key, value, shared = false) {
+        localStorage.setItem(ns(key, shared), value);
+        return { key, value, shared: !!shared };
+      },
+      async delete(key, shared = false) {
+        localStorage.removeItem(ns(key, shared));
+        return { key, deleted: true, shared: !!shared };
+      },
+      async list(prefix = "", shared = false) {
+        const full = ns(prefix, shared);
+        const keys = Object.keys(localStorage)
+          .filter((k) => k.startsWith(`studycards:${shared ? "shared" : "user"}:`) && k.startsWith(full))
+          .map((k) => k.replace(`studycards:${shared ? "shared" : "user"}:`, ""));
+        return { keys, prefix, shared: !!shared };
+      },
+    };
+  })();
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18",
+    "react/jsx-runtime": "https://esm.sh/react@18/jsx-runtime",
+    "react/jsx-dev-runtime": "https://esm.sh/react@18/jsx-dev-runtime",
+    "react-dom/client": "https://esm.sh/react-dom@18/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react"
+  }
+}
+</script>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { createRoot } from "react-dom/client";
+import { Plus, X, Shuffle, RotateCcw, ArrowLeft, ArrowRight, Check, Trash2, Pencil, BookOpen, Layers, Sparkles } from "lucide-react";
+
+
+// ---------- constants ----------
+const genId = () => `id_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+const INDEX_KEY = "sets-index";
+const setKey = (id) => `set:${id}`;
+
+const SAMPLE_SET = {
+  title: "World Capitals",
+  description: "A sample set to try studying and quizzing.",
+  terms: [
+    { term: "France", definition: "Paris" },
+    { term: "Japan", definition: "Tokyo" },
+    { term: "Egypt", definition: "Cairo" },
+    { term: "Australia", definition: "Canberra" },
+    { term: "Brazil", definition: "Brasília" },
+    { term: "Canada", definition: "Ottawa" },
+    { term: "Kenya", definition: "Nairobi" },
+    { term: "Norway", definition: "Oslo" },
+  ],
+};
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ---------- storage helpers ----------
+async function loadIndex() {
+  try {
+    const res = await window.storage.get(INDEX_KEY, false);
+    return res ? JSON.parse(res.value) : [];
+  } catch {
+    return [];
+  }
+}
+async function saveIndex(index) {
+  try {
+    await window.storage.set(INDEX_KEY, JSON.stringify(index), false);
+  } catch (e) {
+    console.error("Failed to save index", e);
+  }
+}
+async function loadSet(id) {
+  try {
+    const res = await window.storage.get(setKey(id), false);
+    return res ? JSON.parse(res.value) : null;
+  } catch {
+    return null;
+  }
+}
+async function saveSet(set) {
+  try {
+    await window.storage.set(setKey(set.id), JSON.stringify(set), false);
+  } catch (e) {
+    console.error("Failed to save set", e);
+  }
+}
+async function deleteSetStorage(id) {
+  try {
+    await window.storage.delete(setKey(id), false);
+  } catch (e) {
+    console.error("Failed to delete set", e);
+  }
+}
+
+// ---------- styles ----------
+const Styles = () => (
+  <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@500;600&display=swap');
+
+    .sc-root {
+      --ink: #2b2a28;
+      --paper: #fbf8f1;
+      --paper-dim: #f2ede1;
+      --chalk: #1f3b32;
+      --chalk-2: #274a3f;
+      --red: #c1443b;
+      --gold: #cf9a2e;
+      --blue: #4a6fa5;
+      --line: rgba(43,42,40,0.12);
+      font-family: 'Source Serif 4', Georgia, serif;
+      color: var(--ink);
+      background: var(--chalk);
+      min-height: 100%;
+      width: 100%;
+    }
+    .sc-display { font-family: 'Space Grotesk', sans-serif; }
+    .sc-mono { font-family: 'JetBrains Mono', monospace; }
+
+    .sc-shell {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 28px 20px 64px;
+    }
+    .sc-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 28px;
+      color: var(--paper);
+    }
+    .sc-wordmark {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .sc-wordmark .chip {
+      width: 30px; height: 30px;
+      border-radius: 5px;
+      background: var(--red);
+      display: flex; align-items: center; justify-content: center;
+      color: var(--paper);
+      transform: rotate(-6deg);
+    }
+    .sc-sub { color: rgba(251,248,241,0.6); font-size: 13px; margin-top: 2px; }
+
+    .sc-btn {
+      font-family: 'Space Grotesk', sans-serif;
+      font-weight: 600;
+      font-size: 14px;
+      border: none;
+      cursor: pointer;
+      border-radius: 8px;
+      padding: 10px 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
+    }
+    .sc-btn:active { transform: scale(0.97); }
+    .sc-btn-primary { background: var(--red); color: var(--paper); }
+    .sc-btn-primary:hover { box-shadow: 0 4px 14px rgba(193,68,59,0.35); }
+    .sc-btn-ghost { background: rgba(251,248,241,0.08); color: var(--paper); }
+    .sc-btn-ghost:hover { background: rgba(251,248,241,0.16); }
+    .sc-btn-paper { background: var(--paper); color: var(--ink); }
+    .sc-btn-paper:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.15); }
+    .sc-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .sc-btn-block { width: 100%; justify-content: center; }
+
+    /* ---- card catalog home grid ---- */
+    .sc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      gap: 22px;
+      margin-top: 6px;
+    }
+    .sc-tile {
+      background: var(--paper);
+      border-radius: 3px;
+      padding: 18px 16px 16px;
+      cursor: pointer;
+      position: relative;
+      box-shadow: 0 6px 16px rgba(0,0,0,0.25);
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      border-left: 3px solid var(--red);
+    }
+    .sc-tile:hover { transform: translateY(-4px) rotate(0deg) !important; box-shadow: 0 12px 24px rgba(0,0,0,0.3); }
+    .sc-tile-title {
+      font-family: 'Space Grotesk', sans-serif;
+      font-weight: 600;
+      font-size: 16px;
+      line-height: 1.25;
+      margin-bottom: 8px;
+      padding-right: 20px;
+    }
+    .sc-tile-meta {
+      font-size: 12px;
+      color: #7a756c;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-top: 1px dashed var(--line);
+      padding-top: 8px;
+      margin-top: 10px;
+    }
+    .sc-tile-del {
+      position: absolute; top: 12px; right: 10px;
+      color: #b7b1a4; background: none; border: none; cursor: pointer;
+      padding: 4px; border-radius: 4px;
+    }
+    .sc-tile-del:hover { color: var(--red); background: rgba(193,68,59,0.08); }
+
+    .sc-tile-new {
+      background: rgba(251,248,241,0.04);
+      border: 1.5px dashed rgba(251,248,241,0.35);
+      border-radius: 3px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 8px;
+      color: var(--paper);
+      cursor: pointer;
+      min-height: 108px;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .sc-tile-new:hover { background: rgba(251,248,241,0.08); border-color: rgba(251,248,241,0.6); }
+
+    .sc-empty {
+      color: rgba(251,248,241,0.75);
+      text-align: center;
+      padding: 60px 20px;
+    }
+    .sc-empty h2 { font-family: 'Space Grotesk', sans-serif; color: var(--paper); font-size: 20px; margin-bottom: 8px; }
+    .sc-empty-actions { display: flex; gap: 10px; justify-content: center; margin-top: 18px; flex-wrap: wrap; }
+
+    /* ---- edit form ---- */
+    .sc-panel {
+      background: var(--paper);
+      border-radius: 6px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+    .sc-field label {
+      display: block;
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #7a756c;
+      margin-bottom: 6px;
+    }
+    .sc-input, .sc-textarea {
+      width: 100%;
+      border: none;
+      border-bottom: 2px solid var(--line);
+      background: transparent;
+      font-family: 'Source Serif 4', serif;
+      font-size: 16px;
+      padding: 8px 2px;
+      outline: none;
+      color: var(--ink);
+      transition: border-color 0.15s ease;
+      box-sizing: border-box;
+    }
+    .sc-input:focus, .sc-textarea:focus { border-color: var(--red); }
+    .sc-term-row {
+      display: grid;
+      grid-template-columns: 28px 1fr 1fr 30px;
+      gap: 12px;
+      align-items: end;
+      padding: 14px 0;
+      border-bottom: 1px dashed var(--line);
+    }
+    .sc-term-row:last-child { border-bottom: none; }
+    .sc-term-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: #b7b1a4;
+      padding-bottom: 10px;
+    }
+    .sc-row-del {
+      background: none; border: none; cursor: pointer; color: #b7b1a4;
+      padding: 6px; border-radius: 4px; height: fit-content;
+    }
+    .sc-row-del:hover { color: var(--red); background: rgba(193,68,59,0.08); }
+
+    /* ---- flashcard ---- */
+    .sc-study-wrap { display: flex; flex-direction: column; align-items: center; }
+    .sc-progress-line {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: rgba(251,248,241,0.75);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+    .sc-card-stage {
+      width: 100%;
+      max-width: 520px;
+      height: 320px;
+      perspective: 1400px;
+      margin: 10px 0 22px;
+    }
+    .sc-card-inner {
+      position: relative;
+      width: 100%; height: 100%;
+      transition: transform 0.5s cubic-bezier(0.4,0.2,0.2,1);
+      transform-style: preserve-3d;
+      cursor: pointer;
+    }
+    .sc-card-inner.flipped { transform: rotateY(180deg); }
+    .sc-card-face {
+      position: absolute; inset: 0;
+      backface-visibility: hidden;
+      background: var(--paper);
+      border-radius: 8px;
+      box-shadow: 0 14px 34px rgba(0,0,0,0.35);
+      display: flex; flex-direction: column;
+      padding: 30px 34px 30px 54px;
+      box-sizing: border-box;
+    }
+    .sc-card-face::before {
+      content: "";
+      position: absolute; left: 26px; top: 0; bottom: 0;
+      width: 2px; background: var(--red); opacity: 0.55;
+    }
+    .sc-card-face::after {
+      content: "";
+      position: absolute; left: 10px; top: 22px; bottom: 22px; width: 8px;
+      background-image: radial-gradient(circle, rgba(43,42,40,0.18) 3px, transparent 3.5px);
+      background-size: 100% 34px;
+      background-repeat: repeat-y;
+    }
+    .sc-card-back { transform: rotateY(180deg); }
+    .sc-card-eyebrow {
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: auto;
+    }
+    .sc-card-text {
+      font-size: 26px;
+      line-height: 1.35;
+      font-weight: 600;
+      font-family: 'Space Grotesk', sans-serif;
+      display: flex;
+      align-items: center;
+      flex: 1;
+    }
+    .sc-card-hint {
+      text-align: center;
+      color: #a19c8f;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .sc-study-controls {
+      display: flex; align-items: center; gap: 14px; margin-top: 6px;
+    }
+    .sc-icon-btn {
+      background: rgba(251,248,241,0.1);
+      border: none;
+      color: var(--paper);
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .sc-icon-btn:hover:not(:disabled) { background: rgba(251,248,241,0.22); }
+    .sc-icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* ---- quiz ---- */
+    .sc-quiz-bar {
+      width: 100%; height: 6px; background: rgba(251,248,241,0.15);
+      border-radius: 4px; overflow: hidden; margin-bottom: 22px;
+    }
+    .sc-quiz-bar-fill { height: 100%; background: var(--gold); transition: width 0.3s ease; }
+    .sc-quiz-q {
+      background: var(--paper);
+      border-radius: 8px;
+      padding: 28px 30px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      margin-bottom: 20px;
+    }
+    .sc-quiz-eyebrow {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px; color: #a19c8f; margin-bottom: 10px;
+    }
+    .sc-quiz-term { font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 600; }
+    .sc-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .sc-option {
+      background: var(--paper);
+      border: 2px solid var(--line);
+      border-radius: 6px;
+      padding: 16px;
+      text-align: left;
+      font-family: 'Source Serif 4', serif;
+      font-size: 15px;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .sc-option:hover:not(:disabled) { border-color: var(--blue); transform: translateY(-2px); }
+    .sc-option:disabled { cursor: default; }
+    .sc-option.correct { border-color: var(--gold); background: #fbf1d9; }
+    .sc-option.incorrect { border-color: var(--red); background: #fbe7e5; }
+    .sc-option .badge {
+      width: 22px; height: 22px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .sc-option.correct .badge { background: var(--gold); color: #fff; }
+    .sc-option.incorrect .badge { background: var(--red); color: #fff; }
+
+    /* ---- results ---- */
+    .sc-results { background: var(--paper); border-radius: 8px; padding: 40px 34px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+    .sc-score-big { font-family: 'JetBrains Mono', monospace; font-size: 56px; font-weight: 600; }
+    .sc-results h2 { font-family: 'Space Grotesk', sans-serif; font-size: 20px; margin: 4px 0 24px; }
+    .sc-missed-list { text-align: left; margin-top: 24px; border-top: 1px dashed var(--line); padding-top: 18px; }
+    .sc-missed-item { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+    .sc-missed-item .t { font-weight: 600; }
+    .sc-missed-item .d { color: var(--red); }
+
+    .sc-backlink {
+      display: inline-flex; align-items: center; gap: 6px;
+      color: rgba(251,248,241,0.7);
+      background: none; border: none; cursor: pointer;
+      font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .sc-backlink:hover { color: var(--paper); }
+
+    .sc-mode-row { display: flex; gap: 14px; margin: 4px 0 22px; }
+    .sc-mode-btn {
+      flex: 1;
+      background: rgba(251,248,241,0.06);
+      border: 1.5px solid rgba(251,248,241,0.18);
+      color: var(--paper);
+      border-radius: 8px;
+      padding: 16px;
+      cursor: pointer;
+      text-align: left;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .sc-mode-btn:hover { background: rgba(251,248,241,0.12); border-color: rgba(251,248,241,0.4); }
+    .sc-mode-btn .m-title { font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .sc-mode-btn .m-sub { font-size: 12px; color: rgba(251,248,241,0.6); margin-top: 4px; }
+
+    @media (max-width: 560px) {
+      .sc-options { grid-template-columns: 1fr; }
+      .sc-card-stage { height: 280px; }
+      .sc-card-text { font-size: 21px; }
+    }
+  `}</style>
+);
+
+// ================= App =================
+function StudyCardsApp() {
+  const [loading, setLoading] = useState(true);
+  const [index, setIndex] = useState([]);
+  const [view, setView] = useState("home"); // home | edit | study | quiz | results
+  const [activeSet, setActiveSet] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const idx = await loadIndex();
+      setIndex(idx);
+      setLoading(false);
+    })();
+  }, []);
+
+  const refreshIndex = async () => {
+    const idx = await loadIndex();
+    setIndex(idx);
+  };
+
+  const openSet = async (id) => {
+    const s = await loadSet(id);
+    if (s) {
+      setActiveSet(s);
+      setView("mode");
+    } else {
+      setError("Couldn't find that set.");
+    }
+  };
+
+  const createSample = async () => {
+    const id = genId();
+    const now = Date.now();
+    const set = { id, ...SAMPLE_SET, createdAt: now, updatedAt: now };
+    await saveSet(set);
+    const newIdx = [{ id, title: set.title, count: set.terms.length, updatedAt: now }, ...index];
+    await saveIndex(newIdx);
+    setIndex(newIdx);
+    setActiveSet(set);
+    setView("mode");
+  };
+
+  const deleteSet = async (id, e) => {
+    e.stopPropagation();
+    if (!window.confirm("Delete this set? This can't be undone.")) return;
+    await deleteSetStorage(id);
+    const newIdx = index.filter((s) => s.id !== id);
+    await saveIndex(newIdx);
+    setIndex(newIdx);
+  };
+
+  return (
+    <div className="sc-root">
+      <Styles />
+      <div className="sc-shell">
+        <header className="sc-header">
+          <div>
+            <div className="sc-wordmark">
+              <span className="chip"><Layers size={16} /></span>
+              Study Cards
+            </div>
+            <div className="sc-sub">A little card catalog for whatever you're learning.</div>
+          </div>
+          {view !== "home" && (
+            <button className="sc-btn sc-btn-ghost" onClick={() => setView("home")}>
+              <ArrowLeft size={15} /> All sets
+            </button>
+          )}
+        </header>
+
+        {loading && <div className="sc-empty">Opening the catalog…</div>}
+
+        {!loading && view === "home" && (
+          <HomeView
+            index={index}
+            onOpen={openSet}
+            onNew={() => { setActiveSet(null); setView("edit"); }}
+            onDelete={deleteSet}
+            onSample={createSample}
+          />
+        )}
+
+        {view === "edit" && (
+          <EditView
+            initial={activeSet}
+            onCancel={() => setView(activeSet ? "mode" : "home")}
+            onSaved={async (set) => {
+              await refreshIndex();
+              setActiveSet(set);
+              setView("mode");
+            }}
+          />
+        )}
+
+        {view === "mode" && activeSet && (
+          <ModeView
+            set={activeSet}
+            onStudy={() => setView("study")}
+            onQuiz={() => setView("quiz")}
+            onEdit={() => setView("edit")}
+          />
+        )}
+
+        {view === "study" && activeSet && (
+          <StudyView set={activeSet} onDone={() => setView("mode")} />
+        )}
+
+        {view === "quiz" && activeSet && (
+          <QuizView
+            set={activeSet}
+            onFinish={(result) => { setActiveSet({ ...activeSet, _lastResult: result }); setView("results"); }}
+            onExit={() => setView("mode")}
+          />
+        )}
+
+        {view === "results" && activeSet && (
+          <ResultsView
+            set={activeSet}
+            result={activeSet._lastResult}
+            onRetake={() => setView("quiz")}
+            onHome={() => setView("home")}
+          />
+        )}
+
+        {error && <div style={{ color: "#f3b0aa", marginTop: 16, fontSize: 13 }}>{error}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Home ----------
+function HomeView({ index, onOpen, onNew, onDelete, onSample }) {
+  if (index.length === 0) {
+    return (
+      <div className="sc-empty">
+        <Sparkles size={26} style={{ marginBottom: 10 }} />
+        <h2>No sets yet</h2>
+        <p>Every card catalog starts with one card. Add some terms, then study or quiz yourself.</p>
+        <div className="sc-empty-actions">
+          <button className="sc-btn sc-btn-primary" onClick={onNew}><Plus size={16} /> Create a set</button>
+          <button className="sc-btn sc-btn-ghost" onClick={onSample}>Try a sample set</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="sc-grid">
+      {index.map((s, i) => {
+        const rot = ((i % 5) - 2) * 1.1;
+        return (
+          <div
+            key={s.id}
+            className="sc-tile"
+            style={{ transform: `rotate(${rot}deg)` }}
+            onClick={() => onOpen(s.id)}
+          >
+            <button className="sc-tile-del" onClick={(e) => onDelete(s.id, e)} title="Delete set">
+              <Trash2 size={14} />
+            </button>
+            <div className="sc-tile-title">{s.title}</div>
+            <div className="sc-tile-meta">
+              <span>{s.count} term{s.count === 1 ? "" : "s"}</span>
+              <span className="sc-mono">{new Date(s.updatedAt).toLocaleDateString()}</span>
+            </div>
+          </div>
+        );
+      })}
+      <div className="sc-tile-new" onClick={onNew}>
+        <Plus size={20} />
+        <span className="sc-display" style={{ fontSize: 14, fontWeight: 600 }}>New set</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Edit ----------
+function EditView({ initial, onCancel, onSaved }) {
+  const [title, setTitle] = useState(initial?.title || "");
+  const [description, setDescription] = useState(initial?.description || "");
+  const [terms, setTerms] = useState(
+    initial?.terms?.length ? initial.terms.map((t) => ({ ...t, _id: genId() })) : [
+      { _id: genId(), term: "", definition: "" },
+      { _id: genId(), term: "", definition: "" },
+    ]
+  );
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const updateTerm = (id, field, value) => {
+    setTerms((prev) => prev.map((t) => (t._id === id ? { ...t, [field]: value } : t)));
+  };
+  const addRow = () => setTerms((prev) => [...prev, { _id: genId(), term: "", definition: "" }]);
+  const removeRow = (id) => setTerms((prev) => prev.filter((t) => t._id !== id));
+
+  const handleSave = async () => {
+    setErr("");
+    const cleanTerms = terms
+      .map((t) => ({ term: t.term.trim(), definition: t.definition.trim() }))
+      .filter((t) => t.term && t.definition);
+    if (!title.trim()) { setErr("Give this set a title."); return; }
+    if (cleanTerms.length < 2) { setErr("Add at least 2 complete terms."); return; }
+
+    setSaving(true);
+    const now = Date.now();
+    const id = initial?.id || genId();
+    const set = {
+      id,
+      title: title.trim(),
+      description: description.trim(),
+      terms: cleanTerms,
+      createdAt: initial?.createdAt || now,
+      updatedAt: now,
+    };
+    await saveSet(set);
+    const idx = await loadIndex();
+    const entry = { id, title: set.title, count: cleanTerms.length, updatedAt: now };
+    const without = idx.filter((s) => s.id !== id);
+    await saveIndex([entry, ...without]);
+    setSaving(false);
+    onSaved(set);
+  };
+
+  return (
+    <div className="sc-panel">
+      <div className="sc-field" style={{ marginBottom: 18 }}>
+        <label>Set title</label>
+        <input
+          className="sc-input"
+          placeholder="e.g. Chapter 4 vocabulary"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 19 }}
+        />
+      </div>
+      <div className="sc-field" style={{ marginBottom: 22 }}>
+        <label>Description (optional)</label>
+        <input
+          className="sc-input"
+          placeholder="What's this set for?"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </div>
+
+      <label style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "#7a756c" }}>
+        Terms
+      </label>
+      <div style={{ marginTop: 8 }}>
+        {terms.map((t, i) => (
+          <div className="sc-term-row" key={t._id}>
+            <div className="sc-term-num sc-mono">{String(i + 1).padStart(2, "0")}</div>
+            <div className="sc-field">
+              <label>Term</label>
+              <input className="sc-input" value={t.term} onChange={(e) => updateTerm(t._id, "term", e.target.value)} />
+            </div>
+            <div className="sc-field">
+              <label>Definition</label>
+              <input className="sc-input" value={t.definition} onChange={(e) => updateTerm(t._id, "definition", e.target.value)} />
+            </div>
+            <button className="sc-row-del" onClick={() => removeRow(t._id)} title="Remove"><X size={16} /></button>
+          </div>
+        ))}
+      </div>
+      <button className="sc-btn sc-btn-ghost" style={{ color: "var(--ink)", background: "var(--paper-dim)", marginTop: 14 }} onClick={addRow}>
+        <Plus size={15} /> Add term
+      </button>
+
+      {err && <div style={{ color: "var(--red)", fontSize: 13, marginTop: 14 }}>{err}</div>}
+
+      <div style={{ display: "flex", gap: 10, marginTop: 26, borderTop: "1px dashed var(--line)", paddingTop: 20 }}>
+        <button className="sc-btn sc-btn-primary" onClick={handleSave} disabled={saving}>
+          <Check size={15} /> {saving ? "Saving…" : "Save set"}
+        </button>
+        <button className="sc-btn sc-btn-ghost" style={{ color: "var(--ink)", background: "var(--paper-dim)" }} onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Mode select ----------
+function ModeView({ set, onStudy, onQuiz, onEdit }) {
+  return (
+    <div>
+      <button className="sc-backlink" onClick={onEdit}><Pencil size={13} /> Edit set</button>
+      <h2 className="sc-display" style={{ color: "var(--paper)", fontSize: 26, marginBottom: 4 }}>{set.title}</h2>
+      {set.description && <p style={{ color: "rgba(251,248,241,0.65)", marginTop: 0 }}>{set.description}</p>}
+      <p className="sc-mono" style={{ color: "rgba(251,248,241,0.5)", fontSize: 13, marginBottom: 22 }}>
+        {set.terms.length} terms
+      </p>
+      <div className="sc-mode-row">
+        <button className="sc-mode-btn" onClick={onStudy}>
+          <div className="m-title"><BookOpen size={16} /> Flashcards</div>
+          <div className="m-sub">Flip through terms at your own pace.</div>
+        </button>
+        <button className="sc-mode-btn" onClick={onQuiz}>
+          <div className="m-title"><Sparkles size={16} /> Quiz</div>
+          <div className="m-sub">Multiple choice, scored at the end.</div>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Study (flashcards) ----------
+function StudyView({ set, onDone }) {
+  const [order, setOrder] = useState(() => set.terms.map((_, i) => i));
+  const [pos, setPos] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+
+  const current = set.terms[order[pos]];
+
+  const go = (delta) => {
+    setFlipped(false);
+    setPos((p) => Math.min(Math.max(p + delta, 0), order.length - 1));
+  };
+  const doShuffle = () => {
+    setOrder(shuffle(set.terms.map((_, i) => i)));
+    setPos(0);
+    setFlipped(false);
+  };
+
+  return (
+    <div className="sc-study-wrap">
+      <div className="sc-progress-line">
+        <span>{set.title}</span>
+        <span className="sc-mono">{pos + 1} / {order.length}</span>
+      </div>
+
+      <div className="sc-card-stage" onClick={() => setFlipped((f) => !f)}>
+        <div className={`sc-card-inner${flipped ? " flipped" : ""}`}>
+          <div className="sc-card-face">
+            <div className="sc-card-eyebrow">Term</div>
+            <div className="sc-card-text">{current.term}</div>
+            <div className="sc-card-hint">tap to flip</div>
+          </div>
+          <div className="sc-card-face sc-card-back">
+            <div className="sc-card-eyebrow" style={{ color: "var(--red)" }}>Definition</div>
+            <div className="sc-card-text">{current.definition}</div>
+            <div className="sc-card-hint">tap to flip back</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="sc-study-controls">
+        <button className="sc-icon-btn" onClick={() => go(-1)} disabled={pos === 0}><ArrowLeft size={18} /></button>
+        <button className="sc-icon-btn" onClick={doShuffle} title="Shuffle"><Shuffle size={18} /></button>
+        {pos === order.length - 1 ? (
+          <button className="sc-btn sc-btn-paper" onClick={onDone}>Done</button>
+        ) : (
+          <button className="sc-icon-btn" onClick={() => go(1)}><ArrowRight size={18} /></button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Quiz ----------
+function buildQuestions(set) {
+  const allDefs = set.terms.map((t) => t.definition);
+  const shuffled = shuffle(set.terms);
+  return shuffled.map((t) => {
+    const distractors = shuffle(allDefs.filter((d) => d !== t.definition)).slice(0, 3);
+    const options = shuffle([t.definition, ...distractors]);
+    return { term: t.term, correct: t.definition, options };
+  });
+}
+
+function QuizView({ set, onFinish, onExit }) {
+  const [questions] = useState(() => buildQuestions(set));
+  const [qIndex, setQIndex] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [score, setScore] = useState(0);
+  const [missed, setMissed] = useState([]);
+
+  const q = questions[qIndex];
+  const isLast = qIndex === questions.length - 1;
+
+  const choose = (opt) => {
+    if (selected) return;
+    setSelected(opt);
+    if (opt === q.correct) {
+      setScore((s) => s + 1);
+    } else {
+      setMissed((m) => [...m, { term: q.term, given: opt, correct: q.correct }]);
+    }
+  };
+
+  const next = () => {
+    if (isLast) {
+      onFinish({ score, total: questions.length, missed: [...missed] });
+    } else {
+      setQIndex((i) => i + 1);
+      setSelected(null);
+    }
+  };
+
+  return (
+    <div>
+      <div className="sc-progress-line">
+        <span>{set.title}</span>
+        <span className="sc-mono">{qIndex + 1} / {questions.length}</span>
+      </div>
+      <div className="sc-quiz-bar">
+        <div className="sc-quiz-bar-fill" style={{ width: `${((qIndex) / questions.length) * 100}%` }} />
+      </div>
+
+      <div className="sc-quiz-q">
+        <div className="sc-quiz-eyebrow">What's the definition of…</div>
+        <div className="sc-quiz-term">{q.term}</div>
+      </div>
+
+      <div className="sc-options">
+        {q.options.map((opt) => {
+          let cls = "sc-option";
+          if (selected) {
+            if (opt === q.correct) cls += " correct";
+            else if (opt === selected) cls += " incorrect";
+          }
+          return (
+            <button key={opt} className={cls} onClick={() => choose(opt)} disabled={!!selected}>
+              {selected && opt === q.correct && <span className="badge"><Check size={13} /></span>}
+              {selected && opt === selected && opt !== q.correct && <span className="badge"><X size={13} /></span>}
+              {opt}
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 22 }}>
+        <button className="sc-btn sc-btn-ghost" onClick={onExit}>Exit quiz</button>
+        <button className="sc-btn sc-btn-primary" onClick={next} disabled={!selected}>
+          {isLast ? "See results" : "Next"} <ArrowRight size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Results ----------
+function ResultsView({ set, result, onRetake, onHome }) {
+  if (!result) return null;
+  const pct = Math.round((result.score / result.total) * 100);
+  const color = pct >= 80 ? "var(--gold)" : pct >= 50 ? "var(--blue)" : "var(--red)";
+
+  return (
+    <div className="sc-results">
+      <div className="sc-score-big" style={{ color }}>{pct}%</div>
+      <h2>{result.score} of {result.total} correct — {set.title}</h2>
+
+      <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+        <button className="sc-btn sc-btn-primary" onClick={onRetake}><RotateCcw size={15} /> Retake quiz</button>
+        <button className="sc-btn sc-btn-ghost" style={{ color: "var(--ink)", background: "var(--paper-dim)" }} onClick={onHome}>
+          Back to sets
+        </button>
+      </div>
+
+      {result.missed.length > 0 && (
+        <div className="sc-missed-list">
+          <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 13, marginBottom: 4 }}>
+            Review these {result.missed.length}
+          </div>
+          {result.missed.map((m, i) => (
+            <div className="sc-missed-item" key={i}>
+              <span className="t">{m.term}</span>
+              <span className="d">{m.correct}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<StudyCardsApp />);
+</script>
+</body>
+</html>
